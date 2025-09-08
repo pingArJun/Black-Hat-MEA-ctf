@@ -1,0 +1,180 @@
+name: Find BHFlagY
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  find-flag:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Show files and make checker executable
+        run: |
+          ls -la
+          if [ -f "./checker" ]; then
+            chmod +x ./checker || true
+            file ./checker || true
+          else
+            echo "ERROR: checker not found in repo root"
+          fi
+
+      - name: Create finder script
+        run: |
+          mkdir -p .github/scripts
+          cat > .github/scripts/find_flag.py <<'PY'
+#!/usr/bin/env python3
+# Automated finder for BHFlagY{...} — runs on macOS runner and executes ./checker to confirm
+import os, re, sys, subprocess, itertools, time
+
+BIN = "./checker"
+if not os.path.exists(BIN):
+    print("ERROR: checker binary not found at", BIN)
+    sys.exit(2)
+
+data = open(BIN, "rb").read()
+prefix = b"BHFlagY{"
+allowed_inner = set(range(48,58)) | set(range(65,91)) | set(range(97,123)) | {95,45}
+# Conservative but effective parameters for GitHub mac runners
+MAX_KEYLEN1 = 48   # primary repeating-xor candidate length
+MAX_KEYLEN2 = 10   # secondary repeating-xor length to try
+SCAN_LEN = 1200    # how many bytes to decode per candidate
+
+def decode_with_key(data, pos, key, maxlen=SCAN_LEN):
+    out = bytearray()
+    for i in range(maxlen):
+        if pos + i >= len(data): break
+        out.append(data[pos+i] ^ key[i % len(key)])
+    return bytes(out)
+
+def run_checker(candidate):
+    try:
+        p = subprocess.run([BIN, candidate], capture_output=True, text=True, timeout=8)
+        out = (p.stdout or "") + (p.stderr or "")
+        return out.strip()
+    except Exception as e:
+        return "ERROR: " + str(e)
+
+def test_candidate(flag_bytes):
+    flag = flag_bytes.decode("latin1")
+    print("[*] Testing candidate:", flag)
+    out = run_checker(flag)
+    print("[*] checker output:", repr(out))
+    if "NOPE" not in out:
+        print("\n\nFOUND FLAG:", flag, "\n\n")
+        return True
+    return False
+
+# 1) Find positions where a repeating XOR key1 maps bytes -> prefix
+print("[*] Scanning for positions where data xor key => prefix ... (this may take a short while)")
+candidates = []
+L = len(data)
+for pos in range(0, max(1, L - len(prefix))):
+    for keylen in range(1, MAX_KEYLEN1 + 1):
+        if pos + len(prefix) > L:
+            break
+        key = [None] * keylen
+        ok = True
+        for i in range(len(prefix)):
+            kidx = i % keylen
+            val = data[pos+i] ^ prefix[i]
+            if key[kidx] is None:
+                key[kidx] = val
+            elif key[kidx] != val:
+                ok = False
+                break
+        if not ok:
+            continue
+        keyb = bytes(k if k is not None else 0 for k in key)
+        dec = decode_with_key(data, pos, keyb, maxlen=200)
+        if dec.startswith(prefix):
+            candidates.append((pos, keyb, dec))
+    if len(candidates) > 2000:
+        break
+
+print("[*] Found", len(candidates), "prefix-candidates. Testing each for real flag...")
+
+# helper transforms
+def rol_byte(b, n): return ((b << n) & 0xFF) | (b >> (8-n))
+def ror_byte(b, n): return (b >> n) | ((b << (8-n)) & 0xFF)
+
+checked = 0
+for pos, key1, dec in candidates:
+    checked += 1
+    if checked % 200 == 0:
+        print(f"[+] Checked {checked}/{len(candidates)} candidates...")
+    # decode a longer region for this candidate
+    dec_long = decode_with_key(data, pos, key1, maxlen=SCAN_LEN)
+    if not dec_long.startswith(prefix):
+        continue
+    inner = dec_long[len(prefix):]
+    # 1) literal printable inner
+    if b"}" in inner[:800]:
+        endidx = inner.find(b"}")
+        payload = inner[:endidx]
+        cand = prefix + payload + b"}"
+        if re.match(br"^BHFlagY\{[A-Za-z0-9_\-]{4,200}\}$", cand):
+            if test_candidate(cand):
+                sys.exit(0)
+    # 2) single-byte XOR applied to inner
+    for k in range(256):
+        t = bytes(b ^ k for b in inner[:800])
+        if b"}" not in t[:800]:
+            continue
+        endidx = t.find(b"}")
+        payload = t[:endidx]
+        if 4 <= len(payload) <= 200 and all(c in allowed_inner for c in payload):
+            cand = prefix + payload + b"}"
+            if test_candidate(cand):
+                sys.exit(0)
+    # 3) small repeating XOR (key2) via pool intersection
+    for L2 in range(1, MAX_KEYLEN2+1):
+        pools = [set(range(256)) for _ in range(L2)]
+        limit = min(400, len(inner))
+        for j in range(limit):
+            idx = j % L2
+            encb = inner[j]
+            pools[idx] &= set((encb ^ v) & 0xFF for v in (allowed_inner | {125}))
+            if not pools[idx]:
+                break
+        if any(len(s) == 0 for s in pools):
+            continue
+        pools_l = [sorted(list(s))[:40] for s in pools]
+        total = 1
+        for p in pools_l: total *= len(p)
+        if total > 2000000:
+            continue
+        for combo in itertools.product(*pools_l):
+            key2 = bytes(combo)
+            dec2 = bytes(inner[i] ^ key2[i % L2] for i in range(len(inner)))
+            if b"}" not in dec2[:400]:
+                continue
+            endidx = dec2.find(b"}")
+            payload = dec2[:endidx]
+            if 4 <= len(payload) <= 200 and all(c in allowed_inner for c in payload):
+                cand = prefix + payload + b"}"
+                if test_candidate(cand):
+                    sys.exit(0)
+    # 4) rotations + single-byte xor
+    for n in range(8):
+        rot = bytes(rol_byte(b, n) for b in inner[:800])
+        for k in range(256):
+            t = bytes(b ^ k for b in rot)
+            if b"}" not in t[:400]: continue
+            endidx = t.find(b"}")
+            payload = t[:endidx]
+            if 4 <= len(payload) <= 200 and all(c in allowed_inner for c in payload):
+                cand = prefix + payload + b"}"
+                if test_candidate(cand):
+                    sys.exit(0)
+
+print("[!] Completed search. No passing candidate detected in this run.")
+# exit 0 so workflow doesn't show as failed; logs contain all tested output
+sys.exit(0)
+PY
+
+      - name: Run finder script on macOS
+        run: |
+          python3 .github/scripts/find_flag.py
