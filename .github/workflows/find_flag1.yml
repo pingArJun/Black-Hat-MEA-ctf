@@ -1,0 +1,24 @@
+name: Find BHFlagY
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  find-flag:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Make checker executable
+        run: |
+          ls -l
+          chmod +x ./checker || true
+          file ./checker || true
+
+      - name: Run finder script
+        env:
+          BIN: ./checker
+        run: |
+          python3 .github/scripts/find_flag.py
